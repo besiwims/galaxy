@@ -684,13 +684,12 @@ The `.gxc` hash is the canonical identity of the deployable package.
 ## E.6 `checksums.txt` format (locked)
 
 `checksums.txt` MUST be ASCII with LF newlines and exactly these lines:
-
+```
 wasm_sha256 <HEX64>
 manifest_sha256 <HEX64>
 provenance_sha256 <HEX64>
 gxc_sha256 <HEX64>
 ```
-
 Each `<HEX64>` MUST be lowercase hex.
 
 ## E.7 Canonical JSON rules (locked)
@@ -1270,11 +1269,11 @@ If chunks must be carried as text, ChunkBytes MUST be encoded using **Base32 (RF
 * then base32 payload
 
 Receivers MUST:
-
+```
 * strip prefix
 * base32 decode
 * parse as ChunkBytes
 * validate as in H.2.2
-
+```
 This rule is locked so that offline regions can share proof bundles even via constrained channels.
 
