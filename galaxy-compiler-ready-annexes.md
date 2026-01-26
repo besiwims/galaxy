@@ -894,3 +894,387 @@ To make the conformance suite executable across all languages on day one, Galaxy
 
 * a reference “conformance contract” per language route (native or AI→cGalaxy),
 * a shared harness that runs the same tests and compares exact bytes.
+
+Below are the **locked, canonical binary encodings** for **Tx / Receipt / Block / ProofBundle**, plus the **cross-cell chunking format** suitable for cellular/low-bandwidth transport. This is end-to-end enough that independent teams can implement node, wallet, bundler, and verifier without “interpretation gaps.”
+
+# Annex G — Canonical Binary Encoding v0.1 (Tx / Receipt / Block / ProofBundle) **LOCKED**
+
+## G.1 Global rules (apply to all objects)
+
+Galaxy binary objects MUST be encoded using the rules below.
+
+**Endianness**
+
+* All fixed-width integers MUST be **little-endian**.
+
+**Variable-length integers**
+
+* All variable-length integers MUST be **ULEB128** (unsigned LEB128), the same encoding already used in GALIR-B.
+
+**Byte strings**
+
+* Byte strings MUST be encoded as:
+  `len: uleb128` + `len bytes`
+
+**Fixed-size primitives**
+
+* `Hash32` = 32 bytes
+* `PubKey32` = 32 bytes (Ed25519 public key)
+* `Sig64` = 64 bytes (Ed25519 signature)
+
+**Domain-separated hashing**
+
+* Every hash in this annex MUST be computed as:
+  `sha256(DOMAIN_TAG || encoded_bytes)`
+* `DOMAIN_TAG` is ASCII bytes specified per object (below).
+* This prevents cross-type collision and ensures canonical identities.
+
+**Length framing**
+
+* When an object is embedded inside another (e.g., Tx inside Block), it MUST be framed as:
+  `obj_len: uleb128` + `obj_bytes`
+
+**Signature rule**
+
+* All signatures use **Ed25519** over a **signing preimage** defined per object.
+* Signatures MUST be validated before accepting any object as truth.
+
+## G.2 Transaction (Tx) v0.1 **LOCKED**
+
+### G.2.1 Purpose
+
+A Tx represents a deterministic call into a contract/module executed in the Galaxy WASM VM. Tx validity MUST be verifiable offline.
+
+### G.2.2 Encoding: `TxBytes`
+
+Tx is encoded as:
+
+1. `tx_version: u8` = `0x01`
+2. `cell_id: Hash32`
+3. `sender_pk: PubKey32`
+4. `nonce: u64_le`
+5. `gas_limit: u64_le`
+6. `fee_asset_id: Hash32` (the “planet/star/moon…” token id paying fees)
+7. `contract_id: Hash32` (from `.gxc` manifest rule: contract identity)
+8. `input: bytes` (uleb len + bytes)
+9. `flags: u32_le` (MVP: MUST be `0`)
+10. `sig: Sig64`
+
+### G.2.3 Signing preimage and tx_id
+
+**Signing preimage** is:
+
+* `TX_SIGN_DOMAIN = b"GALXTX\0"`
+* `preimage = TX_SIGN_DOMAIN || TxCoreBytes`
+
+Where `TxCoreBytes` is `TxBytes` without the final `sig` field (i.e., fields 1–9).
+
+**Signature**
+
+* `sig = ed25519_sign(sender_sk, sha256(preimage))`
+
+**Transaction id**
+
+* `TX_ID_DOMAIN = b"GALXTXID"`
+* `tx_id = sha256(TX_ID_DOMAIN || TxBytes)`
+  (TxBytes includes the signature. This makes tx_id bind to the final signed transaction.)
+
+### G.2.4 Validity rules (locked)
+
+A Tx MUST be rejected if:
+
+* `tx_version != 0x01`
+* signature invalid
+* nonce invalid for sender (chain rule)
+* gas_limit exceeds chain maximum
+* input length exceeds `MAX_INPUT_BYTES`
+* fee_asset_id is not recognized as a valid fee token for the current zone (policy)
+* contract_id not found or not permitted by policy zone rules
+
+## G.3 Event and StorageDiff primitives (used in Receipt) **LOCKED**
+
+### G.3.1 Event encoding
+
+An Event is encoded as:
+
+1. `topic: bytes`
+2. `data: bytes`
+
+Event hash:
+
+* `EVT_DOMAIN = b"GALXEVT\0"`
+* `event_hash = sha256(EVT_DOMAIN || EventBytes)`
+
+Event merkle root:
+
+* `events_root = merkle_root_sha256(event_hashes)`
+* Merkle rule: pairwise sha256 of concatenated child hashes; if odd count, duplicate last. Empty list root = `sha256(b"GALXEVTEMPTY")`.
+
+### G.3.2 StorageDiffItem encoding
+
+A StorageDiffItem represents a committed change.
+
+Encoding:
+
+1. `op: u8` where `0x00 = PUT`, `0x01 = DEL`
+2. `key: bytes`
+3. If `op == PUT`: `value: bytes` else omitted.
+
+Storage diff item hash:
+
+* `SDI_DOMAIN = b"GALXSDI\0"`
+* `sdi_hash = sha256(SDI_DOMAIN || StorageDiffItemBytes)`
+
+Storage diff merkle root:
+
+* `diff_root = merkle_root_sha256(sdi_hashes)`
+* Empty list root = `sha256(b"GALXSDIEMPTY")`.
+
+## G.4 Receipt v0.1 **LOCKED**
+
+### G.4.1 Purpose
+
+A Receipt commits to the deterministic outcome of executing one Tx: status, error code, gas used, event commitments, storage commitments, and post-state root.
+
+### G.4.2 Encoding: `ReceiptBytes`
+
+Receipt is encoded as:
+
+1. `rcpt_version: u8` = `0x01`
+2. `tx_id: Hash32`
+3. `status: u8` where `0x00 = OK`, `0x01 = ERR`
+4. `error_code: u32_le` (MUST be `0` if status OK; else one of Annex D codes)
+5. `gas_used: u64_le`
+6. `return_envelope_sha256: Hash32`
+
+   * OK: hash of returned envelope bytes
+   * ERR: hash of the returned envelope bytes (which is the error envelope)
+7. `events_root: Hash32` (as defined above; on failure in v0.1 MUST be the empty root)
+8. `storage_diff_root: Hash32` (as defined above; on failure MUST be empty root)
+9. `post_state_root: Hash32`
+
+### G.4.3 Receipt hash
+
+* `RCPT_DOMAIN = b"GALXRCPT"`
+* `receipt_hash = sha256(RCPT_DOMAIN || ReceiptBytes)`
+
+### G.4.4 Locked failure side-effects (consistent with Annex D)
+
+If execution results in any error (including `ERR_OOG` or `ERR_TRAP`):
+
+* events_root MUST be empty root
+* storage_diff_root MUST be empty root
+* post_state_root MUST equal the pre-state root of the Tx execution (no changes)
+
+## G.5 BlockHeader v0.1 **LOCKED**
+
+### G.5.1 Purpose
+
+The BlockHeader is the signed commitment to a block’s position and contents.
+
+### G.5.2 Encoding: `HeaderBytes`
+
+Header is encoded as:
+
+1. `hdr_version: u8` = `0x01`
+2. `cell_id: Hash32`
+3. `epoch: u64_le` (MVP: MAY be `0`; used to segment sync eras)
+4. `height: u64_le`
+5. `prev_block_hash: Hash32` (genesis uses all-zero)
+6. `slot: u64_le` (MVP: MUST equal height; logical time)
+7. `tx_root: Hash32`
+8. `receipt_root: Hash32`
+9. `state_root: Hash32`
+10. `producer_pk: PubKey32`
+11. `producer_sig: Sig64`
+
+### G.5.3 Roots and hashes (locked)
+
+Tx merkle root:
+
+* `tx_hash[i] = sha256(b"GALXTXH\0" || TxBytes_i)`
+* `tx_root = merkle_root_sha256(tx_hashes)`
+* Empty root = `sha256(b"GALXTXEMPTY")`
+
+Receipt merkle root:
+
+* `receipt_root = merkle_root_sha256(receipt_hashes)`
+* Empty root forbidden in v0.1 blocks (a block with 0 txs is allowed only if chain explicitly permits it; if permitted, use empty root constant).
+
+Block hash:
+
+* `BLK_DOMAIN = b"GALXBLK\0"`
+* `block_hash = sha256(BLK_DOMAIN || HeaderCoreBytes)`
+  Where `HeaderCoreBytes` is HeaderBytes without `producer_sig`.
+
+Header signature:
+
+* `HDR_SIGN_DOMAIN = b"GALXHDR\0"`
+* `producer_sig = ed25519_sign(producer_sk, sha256(HDR_SIGN_DOMAIN || HeaderCoreBytes))`
+
+## G.6 Block v0.1 **LOCKED**
+
+### G.6.1 Encoding: `BlockBytes`
+
+Block is encoded as:
+
+1. `block_version: u8` = `0x01`
+2. `header: HeaderBytes` (fixed fields including signature)
+3. `tx_count: uleb128`
+4. `txs: [ tx_len + TxBytes ] * tx_count`
+5. `receipt_count: uleb128` (MUST equal tx_count)
+6. `receipts: [ rcpt_len + ReceiptBytes ] * receipt_count`
+
+### G.6.2 Block validity rules (locked)
+
+A block MUST be rejected if:
+
+* `block_version != 0x01`
+* header signature invalid
+* `tx_count != receipt_count`
+* header `tx_root` does not match computed tx_root
+* header `receipt_root` does not match computed receipt_root
+* re-executing txs in order does not produce:
+
+  * receipts matching each tx (status, error_code, gas_used, return hash, roots)
+  * final `state_root` matching the header
+
+## G.7 ProofBundle v0.1 **LOCKED**
+
+### G.7.1 Purpose
+
+A ProofBundle is the portable, offline-syncable object that allows one cell/node to transfer a verified segment of chain history to another.
+
+### G.7.2 Encoding: `BundleBytes`
+
+Bundle is encoded as:
+
+1. `bundle_version: u8` = `0x01`
+2. `src_cell_id: Hash32`
+3. `dst_cell_id: Hash32`
+
+   * broadcast bundles MUST use all-zero dst_cell_id
+4. `epoch: u64_le`
+5. `segment_start_height: u64_le`
+6. `segment_end_height: u64_le` (inclusive; MUST be ≥ start)
+7. `checkpoint_block_hash: Hash32` (hash of block at height start-1, or all-zero if start=0)
+8. `mode: u8` where:
+
+   * `0x00 = FULL_BLOCKS` (MVP REQUIRED)
+   * `0x01 = HEADERS_ONLY` (reserved; not allowed in v0.1)
+9. `block_count: uleb128` (MUST equal `end-start+1`)
+10. `blocks: [ block_len + BlockBytes ] * block_count`
+11. `sender_pk: PubKey32`
+12. `sender_sig: Sig64`
+
+### G.7.3 Bundle hash and signature (locked)
+
+Bundle hash:
+
+* `BNDL_DOMAIN = b"GALXBNDL"`
+* `bundle_hash = sha256(BNDL_DOMAIN || BundleCoreBytes)`
+  Where `BundleCoreBytes` is BundleBytes without `sender_sig`.
+
+Signature:
+
+* `BNDL_SIGN_DOMAIN = b"GALXBNDLSIGN"`
+* `sender_sig = ed25519_sign(sender_sk, sha256(BNDL_SIGN_DOMAIN || bundle_hash))`
+
+### G.7.4 Bundle validity rules (locked)
+
+A bundle MUST be rejected if:
+
+* mode is not `FULL_BLOCKS` in v0.1
+* bundle signature invalid
+* block_count mismatch
+* chain continuity fails within the segment (prev_hash mismatch)
+* checkpoint_block_hash does not match receiver’s known checkpoint (if receiver has it)
+* any block in the bundle fails block validation and deterministic replay rules
+
+# Annex H — Cross-Cell Bundle Chunking Format v0.1 (cellular transport) **LOCKED**
+
+## H.1 Purpose
+
+Chunking exists because proof bundles can be large, and cellular/low-bandwidth transport requires splitting into bounded frames that can be reassembled offline.
+
+This annex defines a canonical chunk format that can be carried over:
+
+* TCP/UDP on cellular data
+* store-and-forward file transfer
+* Bluetooth / local Wi-Fi
+* and later SMS/USSD gateways (with an extra text encoding layer)
+
+## H.2 Chunk object: `ChunkBytes` **LOCKED**
+
+A chunk is encoded as:
+
+1. `chunk_version: u8` = `0x01`
+2. `bundle_hash: Hash32` (from Annex G)
+3. `bundle_len: u32_le` (exact bytes of BundleBytes)
+4. `chunk_count: u32_le`
+5. `chunk_index: u32_le` (0-based; MUST be < chunk_count)
+6. `chunk_offset: u32_le` (offset into BundleBytes)
+7. `payload_len: u32_le`
+8. `payload_bytes: payload_len bytes`
+   These bytes MUST equal `BundleBytes[chunk_offset .. chunk_offset+payload_len)`.
+9. `chunk_payload_sha256: Hash32`
+
+   * `CHUNK_PAY_DOMAIN = b"GALXCHP\0"`
+   * `chunk_payload_sha256 = sha256(CHUNK_PAY_DOMAIN || bundle_hash || chunk_index_le || payload_bytes)`
+10. `chunk_crc32c: u32_le`
+    CRC32C of bytes (1..9) for quick corruption detection. CRC32C is optional in many systems, but in cellular it is extremely helpful; therefore it is locked into v0.1 chunk format.
+
+### H.2.1 Chunk size rules (locked)
+
+* `payload_len` MUST be ≤ `MAX_CHUNK_PAYLOAD` (network policy; recommended default 32 KiB).
+* Chunks MUST cover the entire bundle with no gaps and no overlaps:
+
+  * chunk 0 offset MUST be 0
+  * all offsets and lengths MUST be consistent so reassembly is unambiguous
+
+### H.2.2 Reassembly rules (locked)
+
+A receiver MUST:
+
+1. group chunks by `bundle_hash`
+2. validate CRC32C first for fast rejection
+3. validate `chunk_payload_sha256`
+4. place payload into an in-memory or on-disk buffer at `chunk_offset`
+5. once all bytes are present, validate:
+
+   * computed `bundle_hash` matches the advertised `bundle_hash`
+   * bundle signature inside BundleBytes validates (Annex G)
+6. only then attempt block verification and replay
+
+A receiver MUST reject if:
+
+* any chunk fails CRC32C or sha256 validation
+* any chunk claims an invalid offset/length
+* bundle signature invalid after reassembly
+
+## H.3 Transport framing (binary) **LOCKED**
+
+When chunks are sent over a stream (TCP) or stored in a file containing multiple chunks, each chunk MUST be framed as:
+
+1. `frame_magic: [u8;4]` = `b"GCX0"`
+2. `frame_len: u32_le` (length of ChunkBytes)
+3. `ChunkBytes`
+
+This allows a receiver to scan and recover from partial frames.
+
+## H.4 Text transport layer (SMS / USSD / manual copy) **LOCKED**
+
+If chunks must be carried as text, ChunkBytes MUST be encoded using **Base32 (RFC 4648, uppercase)** with no padding. The text message MUST contain:
+
+* prefix: `"GCX0:"`
+* then base32 payload
+
+Receivers MUST:
+
+* strip prefix
+* base32 decode
+* parse as ChunkBytes
+* validate as in H.2.2
+
+This rule is locked so that offline regions can share proof bundles even via constrained channels.
+
