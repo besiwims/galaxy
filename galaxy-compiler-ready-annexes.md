@@ -1277,3 +1277,188 @@ Receivers MUST:
 ```
 This rule is locked so that offline regions can share proof bundles even via constrained channels.
 
+# Annex I — Galaxy State Commitment v0.1 (Sparse Merkle Tree) **LOCKED**
+
+## I.1 Purpose
+
+Galaxy MUST commit contract state to a single deterministic `state_root` per block so that nodes can verify correctness offline and across devices. Galaxy uses a **Sparse Merkle Tree (SMT)** over a 256-bit keyspace because it provides deterministic membership and non-membership proofs and because it makes corruption and hidden state changes detectable by anyone who can verify hashes.
+
+## I.2 Global state keyspace (how storage becomes one unified truth)
+
+Galaxy state MUST be represented as a single map from **StateKey → ValueBytes** across the whole cell, not as separate per-contract trees, because blocks commit to exactly one `state_root`. A contract’s local storage key is namespaced into the global keyspace using the rule below.
+
+### I.2.1 StateKey derivation (locked)
+
+Given:
+
+* `contract_id: Hash32`
+* `user_key: bytes`
+
+Compute:
+
+* `STATEKEY_DOMAIN = b"GALXSTATEKEY"`
+* `state_key = sha256(STATEKEY_DOMAIN || contract_id || uleb128(len(user_key)) || user_key)`
+
+The SMT path is the 256-bit `state_key` interpreted as a big-endian bitstring (bit 255 is the first branch decision, bit 0 is the last). This is locked so every implementation walks the same path.
+
+## I.3 Hashing primitives (locked)
+
+All SMT hashing MUST use SHA-256 with domain separation.
+
+### I.3.1 Leaf hashing (locked)
+
+If a key is present, define:
+
+* `VAL_DOMAIN = b"GALXVAL\0"`
+* `value_hash = sha256(VAL_DOMAIN || uleb128(len(value)) || value)`
+
+Then:
+
+* `LEAF_DOMAIN = b"GALXLEAF"`
+* `leaf_hash = sha256(LEAF_DOMAIN || state_key || value_hash)`
+
+If a key is absent, the leaf hash is the fixed constant:
+
+* `EMPTY_LEAF = sha256(b"GALXEMPTYLEAF")`
+
+### I.3.2 Internal node hashing (locked)
+
+* `NODE_DOMAIN = b"GALXNODE"`
+* `node_hash(left:Hash32, right:Hash32) = sha256(NODE_DOMAIN || left || right)`
+
+## I.4 Default empty subtree hashes (locked)
+
+Galaxy MUST define deterministic “default hashes” for empty subtrees so the SMT root can be computed without materializing absent nodes.
+
+Let:
+
+* `D[0] = EMPTY_LEAF`
+* For `h in 1..=256`:
+  `D[h] = node_hash(D[h-1], D[h-1])`
+
+`D[h]` represents the hash of an entirely empty subtree of height `h`. The SMT root of an entirely empty state is `D[256]`.
+
+This default hash ladder MUST be used by all nodes and MUST be identical across implementations.
+
+## I.5 SMT root definition (locked)
+
+The canonical `state_root` is the hash at height 256 of the SMT over all present `(state_key → value)` pairs, using:
+
+* `leaf_hash` for present keys,
+* `EMPTY_LEAF` for absent keys,
+* and default subtree hashes `D[h]` where nodes are not explicitly materialized.
+
+## I.6 Update semantics (puts and deletes)
+
+A storage write in a successful transaction produces a deterministic update to the SMT:
+
+* A `PUT` sets the key’s leaf to the computed `leaf_hash` for the new value.
+* A `DEL` sets the key’s leaf back to `EMPTY_LEAF`.
+
+The updated `state_root` after applying all successful tx diffs in block order MUST equal the `state_root` committed in the block header (Annex G). If any node recomputes a different root, the block MUST be rejected as invalid (`ERR_STATE_ROOT_MISMATCH`).
+
+# Annex J — Galaxy SMT Proof Encoding v0.1 **LOCKED**
+
+## J.1 Purpose
+
+Galaxy MUST support canonical membership and non-membership proofs so that nodes can verify state facts efficiently and so that future proof bundles can include proofs instead of requiring full re-execution. Proofs must be deterministic and byte-for-byte canonical.
+
+## J.2 Proof object framing (locked)
+
+A proof is encoded as:
+
+1. `proof_version: u8` = `0x01`
+2. `contract_id: Hash32`
+3. `user_key: bytes`
+4. `state_key: Hash32` (MUST equal Annex I derivation; verifiers MUST recompute and reject mismatches)
+5. `present: u8` where `0x00 = ABSENT`, `0x01 = PRESENT`
+6. If `present == 0x01`: `value: bytes` (exact value bytes)
+7. `bitmap: [u8;32]` (256-bit bitmap)
+8. `siblings_count: uleb128`
+9. `siblings: [Hash32] * siblings_count`
+10. `claimed_root: Hash32`
+
+This proof is standalone and can be carried in a future proof-bundle extension without modifying block format.
+
+## J.3 Bitmap and sibling ordering (locked)
+
+The bitmap indicates at which tree levels the proof includes an explicit sibling hash different from the default.
+
+* The bitmap has 256 bits.
+* Bit index `i` corresponds to tree height step `i` from the leaf upward:
+
+  * `i = 0` means sibling at leaf level (combining leaf into parent),
+  * `i = 255` means sibling at the topmost step.
+
+If a bit is **0**, the verifier MUST use the default hash `D[i]` for that sibling (from Annex I ladder).
+If a bit is **1**, the verifier MUST take the next sibling hash from the `siblings` array.
+
+`siblings` MUST be consumed in strictly increasing `i` order. `siblings_count` MUST equal the number of 1-bits in bitmap. If not, the proof MUST be rejected.
+
+This compressed proof format is locked to avoid the 256-hash overhead for most keys.
+
+## J.4 Proof verification algorithm (locked)
+
+A verifier MUST perform these steps:
+
+1. Recompute `state_key` from `(contract_id, user_key)` using Annex I. Reject if it does not equal the encoded `state_key`.
+
+2. Compute the leaf hash:
+
+* If `present == 0x01`, compute `value_hash` and `leaf_hash` using Annex I leaf hashing.
+* If `present == 0x00`, set `leaf_hash = EMPTY_LEAF`.
+
+3. Set `acc = leaf_hash`.
+
+4. For each level `i` from `0` to `255`:
+
+* Determine `bit = (state_key >> i) & 1` **but note** the path bit ordering is locked as follows:
+  The SMT path uses the bits of `state_key` from **most significant to least significant**.
+  Therefore, at step `i` (0..255), the path decision bit is:
+  `path_bit = (state_key[byte_index] >> bit_index) & 1` where the first decision uses the MSB of byte 0.
+  Concretely: `path_bit = ((state_key[(i/8)] >> (7-(i%8))) & 1)`
+
+* Determine the sibling hash:
+
+  * If bitmap bit `i` is 0, `sib = D[i]`
+  * If bitmap bit `i` is 1, `sib = siblings[next]`
+
+* Combine:
+
+  * If `path_bit == 0`, then `acc = node_hash(acc, sib)`
+  * If `path_bit == 1`, then `acc = node_hash(sib, acc)`
+
+5. After the loop, `acc` is the computed root. The verifier MUST check `acc == claimed_root`. If not, reject.
+
+## J.5 Canonicality rules (locked)
+
+A proof MUST be rejected if:
+
+* `proof_version != 0x01`
+* `present` is not 0 or 1
+* `present == 0x01` and `value` length exceeds `MAX_VALUE_BYTES`
+* `siblings_count` does not match number of 1-bits in bitmap
+* any sibling equals an invalid length (must be exactly 32 bytes)
+* `claimed_root` does not match recomputed root
+
+## J.6 Non-membership meaning (locked)
+
+A proof with `present == 0x00` is a **non-membership proof** for the key. It proves that, under the claimed root, the leaf at that exact path is empty. Galaxy locks this interpretation because it is sufficient for “key absent” verification and remains deterministic.
+
+# Annex K — State Proof Integration Policy (v0.1 vs v0.2) **LOCKED**
+
+## K.1 v0.1 rule (current chain operation)
+
+In v0.1, consensus verification of blocks and proof bundles MUST rely on deterministic re-execution (Annex G ProofBundle mode FULL_BLOCKS). Nodes MAY compute and store SMT proofs for internal use, but proofs are not required for block acceptance.
+
+## K.2 v0.2 forward-compatible rule (proof bundles with proofs)
+
+Galaxy will introduce a `ProofBundle` version increment when proof-carrying bundles are standardized. When that happens, the proof format MUST be Annex J unchanged, so existing verifiers and SDK tooling remain compatible.
+
+This forward rule is locked so the ecosystem can safely build around Annex J proofs today without worrying about later redefinition.
+
+## What is now truly “chain critical” and locked
+
+* `state_root` is now fully defined and reproducible across nodes (Annex I).
+* Membership/non-membership proofs are now canonical and deterministic (Annex J).
+* The chain can remain v0.1 re-exec based while still standardizing proofs for the next phase (Annex K).
